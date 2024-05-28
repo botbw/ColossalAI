@@ -1,5 +1,6 @@
 # this code is inspired by the DeepSpeed library and implemented with our own design from scratch
 import copy
+from collections import defaultdict
 from contextlib import contextmanager
 from functools import partial
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -60,8 +61,6 @@ class LowLevelZeroFP16MixedPrecisionMixin(FP16MixedPrecisionMixin):
 
 
 class LowLevelZeroOptimizer(OptimizerWrapper):
-    """Optimizer used for ZeRO-1 and ZeRO-2."""
-
     def __init__(
         self,
         optimizer: Optimizer,
@@ -81,7 +80,6 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
         cpu_offload: bool = False,  # cpu offload
         dp_process_group: Optional[ProcessGroup] = None,  # the dp pg for comm
         forced_dtype: Optional[torch.dtype] = None,
-        moe_extra_dp_process_group: Optional[ProcessGroup] = None,
         master_weights: bool = True,  # master weights
     ):
         super(LowLevelZeroOptimizer, self).__init__(optim=optimizer)
@@ -90,7 +88,28 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
         self._logger = get_dist_logger()
         self._verbose = verbose
 
+        # stage 2
+        self._partition_grads = partition_grad
+
         self._cpu_offload = cpu_offload
+
+        # grad accumulation
+        self.require_grad_sync = True
+
+        # if process_group is none, will use the default one
+        self.dp_pg = dp_process_group
+        self._local_rank = dist.get_rank(group=self.dp_pg)
+        self._world_size = dist.get_world_size(group=self.dp_pg)
+
+        # extra dp
+        # This group is used to sync moe param, dp_world_size = moe_duplicates * extra_dp_size.
+        # Non moe param will be sync by global dp pg, moe param will be sync by extra dp pg.
+        # Moe param grad is be split as non moe param by global dp pg, and grad will be merged in step.
+        # And moe working and master param are split by extra dp pg.
+        self.moe_extra_dp_pg = moe_extra_dp_process_group
+        if self.moe_extra_dp_pg is not None:
+            self.moe_extra_dp_pg_size = dist.get_world_size(group=self.moe_extra_dp_pg)
+            self.moe_extra_dp_pg_rank = dist.get_rank(group=self.moe_extra_dp_pg)
 
         # working and master params for mixed precision training
         self._working_param_groups = dict()
@@ -206,13 +225,20 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
 
     def _sanity_checks(self):
         assert get_accelerator().name in ["cuda", "npu"], "device is required"
+        inv = defaultdict(list)
         for param_group in self.optim.param_groups:
             group_params = param_group["params"]
             for param in group_params:
+                inv[param].append(param_group)
                 if not hasattr(param, "skip_zero_check") or param.skip_zero_check is False:
                     assert (
                         param.dtype == self._dtype
                     ), f"Parameters are expected to have the same dtype `{self._dtype}`, but got `{param.dtype}`"
+
+        for _, grps in inv.items():
+            assert (
+                len(grps) == 1
+            ), "Parameters should only appear in one group, since we assume that each strategy only manages one param group"
 
     def _create_master_param_current_rank(self, param_list):
         # split each param evenly by world size
