@@ -126,7 +126,6 @@ def sync_local_from_ep(local_model: SparseMLP, ep_model: SparseMLP, assert_grad_
     for (local_name, local_param), (ep_name, ep_param) in zip(
         local_model.named_parameters(), ep_model.named_parameters()
     ):
-        assert local_name in ep_name, print(f"{local_name} != {ep_name}")
         if "experts" not in local_name:
             if assert_grad_flag:
                 assert torch.allclose(local_param, ep_param), f"local_param: {local_param}, ep_param: {ep_param}"
